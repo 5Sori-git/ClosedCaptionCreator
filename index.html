@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="음성/영상 파일을 브라우저에서 완전히 로컬로 처리해 자막(SRT/VTT)을 만드는 도구. 서버 업로드 없음."
+    />
+    <title>ClosedCaptionCreator — 로컬 음성 자막 생성기</title>
+    <!--
+      coi-serviceworker: GitHub Pages 같은 정적 호스트는 COOP/COEP 응답 헤더를
+      설정할 수 없다. 이 서비스워커가 클라이언트 측에서 헤더를 주입해
+      cross-origin isolation(SharedArrayBuffer / 멀티스레드 wasm)을 활성화한다.
+      최초 1회 자동 새로고침이 발생할 수 있다.
+    -->
+    <script src="coi-serviceworker.js"></script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
