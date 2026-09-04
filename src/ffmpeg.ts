@@ -7,7 +7,8 @@
  * 받아오므로 COEP require-corp 하에서도 차단되지 않는다.
  */
 import { FFmpeg } from "@ffmpeg/ffmpeg";
-import { fetchFile, toBlobURL } from "@ffmpeg/util";
+import { toBlobURL } from "@ffmpeg/util";
+import { readFileBytes } from "./readfile";
 
 const CORE_VERSION = "0.12.6";
 
@@ -56,8 +57,11 @@ export async function extractAudioFromVideo(
   const inputName = `input${ext}`;
   const outputName = "audio.wav";
 
-  onLog?.("입력 파일 기록 중...");
-  await ffmpeg.writeFile(inputName, await fetchFile(file));
+  onLog?.("입력 파일 읽는 중...");
+  const bytes = await readFileBytes(file);
+
+  onLog?.(`입력 파일 기록 중... (${(bytes.byteLength / 1024 / 1024).toFixed(1)}MB)`);
+  await ffmpeg.writeFile(inputName, bytes);
 
   onLog?.("오디오 트랙 추출 중...");
   await ffmpeg.exec([

@@ -6,6 +6,7 @@
  * - 16kHz 가 아니면 OfflineAudioContext 로 리샘플, 스테레오는 mono 로 다운믹스
  */
 import { extractAudioFromVideo } from "./ffmpeg";
+import { readFileBytes } from "./readfile";
 
 const TARGET_SAMPLE_RATE = 16000;
 
@@ -28,10 +29,23 @@ export async function fileToPcm16k(file: File, onLog?: Logger): Promise<DecodedA
   let bytes: ArrayBuffer;
 
   if (isVideo(file)) {
-    onLog?.("영상에서 오디오 추출 중 (ffmpeg.wasm)...");
-    bytes = await extractAudioFromVideo(file, onLog);
+    try {
+      onLog?.("영상에서 오디오 추출 중 (ffmpeg.wasm)...");
+      bytes = await extractAudioFromVideo(file, onLog);
+    } catch (err) {
+      // ffmpeg 경로 실패 시: 브라우저 내장 디코더로 원본 컨테이너를 직접 시도
+      // (AAC 오디오가 든 mp4/mov 는 Chrome 등에서 그대로 디코드되는 경우가 많다)
+      onLog?.(
+        `ffmpeg 추출 실패 → 브라우저 내장 디코더로 재시도: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      const u8 = await readFileBytes(file);
+      bytes = u8.slice().buffer as ArrayBuffer;
+    }
   } else {
-    bytes = await file.arrayBuffer();
+    const u8 = await readFileBytes(file);
+    bytes = u8.slice().buffer as ArrayBuffer;
   }
 
   onLog?.("오디오 디코딩 중...");
@@ -49,6 +63,12 @@ export async function fileToPcm16k(file: File, onLog?: Logger): Promise<DecodedA
   let audioBuffer: AudioBuffer;
   try {
     audioBuffer = await ctx.decodeAudioData(bytes.slice(0));
+  } catch (err) {
+    throw new Error(
+      `오디오 디코딩에 실패했습니다. 지원되지 않는 코덱이거나 파일이 손상됐을 수 있습니다. ` +
+        `다른 파일로 시도하거나, 파일을 표준 mp4(H.264/AAC) 또는 wav 로 변환해 보세요. ` +
+        `(${err instanceof Error ? `${err.name}: ${err.message}` : String(err)})`,
+    );
   } finally {
     await ctx.close().catch(() => {});
   }
