@@ -4,8 +4,10 @@ import { toSRT, toVTT, toPlainText, type Cue } from "./subtitle";
 import {
   runPipeline,
   fmtDuration,
+  fmtEta,
   WINDOW_SEC,
   type PipelineOptions,
+  type ProgressInfo,
 } from "./pipeline";
 import { makeSignature, peekProgress } from "./progress-store";
 
@@ -310,6 +312,36 @@ function updateTrack(cues: Cue[]) {
 }
 
 /* ------------------------------------------------------------------ *
+ * 진행률 / 예상 시간 (1초 티커로 메시지 사이를 보간)
+ * ------------------------------------------------------------------ */
+let lastProg: (ProgressInfo & { at: number }) | null = null;
+let ticker: number | null = null;
+let phaseAt = 0;
+
+function renderProgress() {
+  if (!lastProg) return;
+  if (Date.now() - phaseAt < 2000) return; // 방금 표시한 단계 메시지를 잠깐 유지
+
+  const { processedSec, totalSec, etaSec, speed, cuesCount, at } = lastProg;
+  const ageSec = (Date.now() - at) / 1000;
+  const projected =
+    speed && totalSec > 0 ? Math.min(totalSec, processedSec + speed * ageSec) : processedSec;
+
+  if (totalSec > 0) {
+    const pct = (projected / totalSec) * 100;
+    setBar(pct);
+    let s = `전사 중 ${pct.toFixed(0)}% · ${fmtDuration(projected)} / ${fmtDuration(totalSec)}`;
+    if (etaSec != null) s += ` · 남은 시간 ${fmtEta(Math.max(0, etaSec - ageSec))}`;
+    else s += " · 남은 시간 계산 중…";
+    if (speed) s += ` · ${speed.toFixed(1)}x`;
+    s += ` · 자막 ${cuesCount}줄`;
+    setStatus(s);
+  } else {
+    setStatus(`전사 중 · ${fmtDuration(projected)} 처리 · 자막 ${cuesCount}줄`);
+  }
+}
+
+/* ------------------------------------------------------------------ *
  * 실행 / 중지
  * ------------------------------------------------------------------ */
 el.runBtn.addEventListener("click", () => {
@@ -351,6 +383,11 @@ async function run() {
   setBar(0);
   setStatus("시작하는 중…");
 
+  lastProg = null;
+  phaseAt = Date.now();
+  if (ticker) clearInterval(ticker);
+  ticker = window.setInterval(renderProgress, 1000);
+
   mountMedia(file);
 
   const options: PipelineOptions = { file, modelKey, device: state.device, language, resume };
@@ -362,21 +399,19 @@ async function run() {
         setBar(pct);
         setStatus(detail);
       },
-      onPhase: (label) => setStatus(label),
-      onWindow: ({ processedSec, totalSec, cues }) => {
+      onPhase: (label) => {
+        phaseAt = Date.now();
+        setStatus(label);
+      },
+      onProgress: (p) => {
+        lastProg = { ...p, at: Date.now() };
+        renderProgress();
+      },
+      onWindow: ({ cues }) => {
         state.cues = cues;
         el.subsArea.value = toSRT(cues);
         el.resultPanel.classList.remove("hidden");
         updateTrack(cues);
-        if (totalSec > 0) {
-          const pct = (processedSec / totalSec) * 100;
-          setBar(pct);
-          setStatus(
-            `전사 중 ${pct.toFixed(0)}% · ${fmtDuration(processedSec)} / ${fmtDuration(totalSec)} · 자막 ${cues.length}줄`,
-          );
-        } else {
-          setStatus(`전사 중 · ${fmtDuration(processedSec)} 처리 · 자막 ${cues.length}줄`);
-        }
         el.resultMeta.textContent = `(진행 중 · ${cues.length}줄)`;
       },
       shouldCancel: () => state.cancelRequested,
@@ -407,6 +442,11 @@ async function run() {
   } finally {
     state.running = false;
     state.cancelRequested = false;
+    if (ticker) {
+      clearInterval(ticker);
+      ticker = null;
+    }
+    lastProg = null;
     el.runBtn.textContent = "자막 생성";
     el.runBtn.disabled = false;
     refreshResumeNote();

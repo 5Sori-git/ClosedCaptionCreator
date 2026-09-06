@@ -37,11 +37,25 @@ export interface PipelineOptions {
   resume: boolean;
 }
 
+export interface ProgressInfo {
+  /** 지금까지 전사한 오디오 위치(초, 절대) */
+  processedSec: number;
+  totalSec: number;
+  /** 남은 예상 시간(초). 아직 추정 불가면 null */
+  etaSec: number | null;
+  /** 처리 속도 (x 실시간). 아직 추정 불가면 null */
+  speed: number | null;
+  /** 지금까지 만든 자막 조각 수 */
+  cuesCount: number;
+}
+
 export interface PipelineCallbacks {
   onLog: (message: string) => void;
   /** 모델 다운로드 진행 (최초 1회). pct 0~100 */
   onModelDownload: (pct: number, detail: string) => void;
   onPhase: (label: string) => void;
+  /** 전사 세부 진행 (구간 내 30초 청크마다 + 구간 종료 시). 자주 호출됨 */
+  onProgress: (info: ProgressInfo) => void;
   /** 한 구간 끝날 때마다: 지금까지의 자막과 처리 위치 */
   onWindow: (info: { processedSec: number; totalSec: number; cues: Cue[] }) => void;
   /** true 를 돌려주면 다음 구간 전에 중단(진행은 저장됨) */
@@ -63,6 +77,7 @@ let onReady: (() => void) | null = null;
 let onResult: ((r: { chunks: WhisperChunk[] }) => void) | null = null;
 let onError: ((e: Error) => void) | null = null;
 let onDownload: ((pct: number, detail: string) => void) | null = null;
+let onSeg: ((offsetSec: number) => void) | null = null;
 
 function ensureWorker(): Worker {
   if (worker) return worker;
@@ -77,6 +92,9 @@ function ensureWorker(): Worker {
         onDownload?.(m.overall, `${done}/${m.files.length} 파일`);
         break;
       }
+      case "seg_progress":
+        onSeg?.(m.offsetSec as number);
+        break;
       case "ready":
         onReady?.();
         onReady = null;
@@ -102,10 +120,21 @@ function workerLoad(modelKey: ModelKey, device: DeviceKind): Promise<void> {
   });
 }
 
-function workerTranscribe(pcm: Float32Array, language: string): Promise<WhisperChunk[]> {
+function workerTranscribe(
+  pcm: Float32Array,
+  language: string,
+  onSegProgress: (offsetSec: number) => void,
+): Promise<WhisperChunk[]> {
   return new Promise((resolve, reject) => {
-    onResult = ({ chunks }) => resolve(chunks);
-    onError = reject;
+    onSeg = onSegProgress;
+    onResult = ({ chunks }) => {
+      onSeg = null;
+      resolve(chunks);
+    };
+    onError = (e) => {
+      onSeg = null;
+      reject(e);
+    };
     ensureWorker().postMessage({ type: "transcribe", audio: pcm, language }, [pcm.buffer]);
   });
 }
@@ -119,6 +148,16 @@ export function fmtDuration(sec: number): string {
   const ss = s % 60;
   const mm = String(m).padStart(h ? 2 : 1, "0");
   return (h ? `${h}:` : "") + `${mm}:${String(ss).padStart(2, "0")}`;
+}
+
+/** 남은 시간을 대략적인 한국어 문구로. */
+export function fmtEta(sec: number): string {
+  if (!Number.isFinite(sec) || sec < 45) return "1분 미만";
+  const totalMin = Math.round(sec / 60);
+  if (totalMin < 60) return `약 ${totalMin}분`;
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return m ? `약 ${h}시간 ${m}분` : `약 ${h}시간`;
 }
 
 export async function runPipeline(
@@ -160,6 +199,21 @@ export async function runPipeline(
   const numWindows =
     totalSec > 0 ? Math.max(1, Math.ceil(totalSec / WINDOW_SEC)) : Number.MAX_SAFE_INTEGER;
 
+  // ETA / 속도 추정: 모델 로드가 끝난 지금부터 벽시계 측정
+  const transcribeStartMs = performance.now();
+  const baseProcessedSec = startIndex * WINDOW_SEC; // 재개분은 이미 처리된 것으로 간주
+  let lastProcessedSec = baseProcessedSec;
+
+  const emitProgress = (processedSec: number) => {
+    lastProcessedSec = processedSec;
+    const wall = (performance.now() - transcribeStartMs) / 1000;
+    const doneSinceStart = Math.max(0, processedSec - baseProcessedSec);
+    const speed = wall > 3 && doneSinceStart > 1 ? doneSinceStart / wall : null;
+    const etaSec =
+      speed && totalSec > 0 ? Math.max(0, (totalSec - processedSec) / speed) : null;
+    cb.onProgress({ processedSec, totalSec, etaSec, speed, cuesCount: rawChunks.length });
+  };
+
   let canceled = false;
 
   for (let i = startIndex; i < numWindows; i++) {
@@ -178,18 +232,37 @@ export async function runPipeline(
     const segDur = segEnd - segStart;
     const isLast = totalSec > 0 && bandHi >= totalSec;
 
+    const windowLabel = totalSec > 0 ? `구간 ${i + 1}/${numWindows}` : `구간 ${i + 1}`;
     cb.onPhase(
-      `전사 중 · ${fmtDuration(bandLo)} / ${totalSec > 0 ? fmtDuration(totalSec) : "?"}` +
-        (totalSec > 0 ? ` (구간 ${i + 1}/${numWindows})` : ` (구간 ${i + 1})`),
+      `전사 중 · ${fmtDuration(bandLo)} / ${totalSec > 0 ? fmtDuration(totalSec) : "?"} (${windowLabel})`,
     );
 
+    cb.onLog(`${windowLabel} 오디오 추출 중… (${fmtDuration(segDur)} 분량)`);
     const pcm = await extractSegmentPcm(inputPath, segStart, segDur, cb.onLog);
     if (pcm.length < SAMPLE_RATE) {
       cb.onLog(`구간 ${i + 1}: 오디오 없음 → 종료`);
       break;
     }
 
-    const chunks = await workerTranscribe(pcm, opts.language);
+    cb.onLog(`${windowLabel} 전사 시작…`);
+    emitProgress(lastProcessedSec);
+    const segT0 = performance.now();
+
+    let lastSegEmitMs = 0;
+    const chunks = await workerTranscribe(pcm, opts.language, (offsetSec) => {
+      const now = performance.now();
+      if (now - lastSegEmitMs < 250) return; // 과도한 DOM 갱신 방지
+      lastSegEmitMs = now;
+      const absSec = segStart + offsetSec;
+      const bandProcessed = Math.min(WINDOW_SEC, Math.max(0, absSec - bandLo));
+      const processed =
+        totalSec > 0 ? Math.min(totalSec, bandLo + bandProcessed) : absSec;
+      emitProgress(Math.max(lastProcessedSec, processed));
+    });
+
+    cb.onLog(
+      `${windowLabel} 전사 완료 · ${fmtDuration((performance.now() - segT0) / 1000)} 소요`,
+    );
 
     for (const c of chunks) {
       const relStart = c.timestamp?.[0] ?? 0;
@@ -206,6 +279,7 @@ export async function runPipeline(
 
     const cues = chunksToCues(rawChunks, { totalDuration: totalSec });
     const processedSec = totalSec > 0 ? Math.min(totalSec, bandHi) : segEnd;
+    emitProgress(processedSec);
     cb.onWindow({ processedSec, totalSec, cues });
 
     saveProgress({
