@@ -8,16 +8,26 @@
 - **영상 오디오 추출**: `ffmpeg.wasm`
 - **배포**: GitHub Pages (정적)
 
-## 동작 방식
+## 동작 방식 — 시간 창(window) 스트리밍
+
+파일 전체를 메모리에 올리지 않고 **10분 구간씩** 잘라서 처리하므로, 길이/크기 제한이 사실상 없다.
 
 ```
 파일 선택
-  → (영상) ffmpeg.wasm 으로 오디오 트랙 추출
-  → Web Audio API 로 16kHz mono PCM 디코드/리샘플
-  → Web Worker 에서 Whisper 추론 (WebGPU / WASM)
-  → 세그먼트 타임스탬프 → 자막 큐 → SRT / VTT
-  → 미리보기 + 다운로드
+  → ffmpeg.wasm 에 WORKERFS 로 마운트 (Blob 지연 로딩, 힙 복사 없음)
+  → 전체 길이 probe
+  → for 각 10분 구간 [i·W, (i+1)·W):
+       ffmpeg 로 그 구간만 16kHz mono float32 PCM 추출 (앞뒤 4초 여유)
+       Web Worker 에서 Whisper 추론 (WebGPU / WASM)
+       세그먼트 타임스탬프에 오프셋 → 수용 밴드 안의 조각만 채택(경계 중복 제거)
+       부분 자막 즉시 표시 + localStorage 에 진행 저장
+  → SRT / VTT / TXT + 미리보기
 ```
+
+- **최대 메모리 ≈ 한 구간분**(10분이면 PCM ~38MB). 3시간이든 10시간이든 동일.
+- **재개**: 탭이 죽거나 새로고침해도, 같은 파일·옵션으로 다시 실행하면 마지막 구간부터 이어감.
+- **중지**: 실행 중 "중지"를 누르면 현재 구간을 마치고 멈추며, 진행은 저장된다.
+- 처리 **시간만** 길이에 비례한다.
 
 모델 가중치는 최초 1회 Hugging Face CDN 에서 내려받아 브라우저 캐시에 저장됩니다(레포에 포함되지 않음).
 
@@ -71,6 +81,14 @@ WebGPU 경로는 `SharedArrayBuffer` 없이도 동작하므로, isolation 이 �
 - WebGPU 미지원 시 자동으로 WASM 모드로 동작 (수 배 느림, `small` 권장)
 - HTTPS(또는 localhost) 필수 — 서비스워커/WebGPU 는 secure context 요구
 
+## 크기 / 길이 제한
+
+- **파일 크기**: WORKERFS 지연 마운트라 파일을 통째로 읽지 않음 → 사실상 디스크 용량까지.
+- **길이**: 제한 없음. 10분 구간 스트리밍이라 메모리는 일정하고, **처리 시간만** 길이에 비례.
+  - WebGPU + turbo: 대략 실시간의 5~15배 (1시간 ≈ 5~12분)
+  - WASM + small: 대략 실시간의 0.5~1배 (1시간 ≈ 1~2시간+)
+- ffmpeg 코어(`@ffmpeg/core` ~30MB)를 unpkg 에서 1회 로드 → 오프라인/차단 환경에서는 실패.
+
 ## 한계 / TODO
 
 - 화자 분리(diarization) 미지원
@@ -78,6 +96,7 @@ WebGPU 경로는 `SharedArrayBuffer` 없이도 동작하므로, isolation 이 �
 - 실시간 마이크 입력 미지원 (파일 기반)
 - 번역 자막 미지원
 - silero-VAD 전처리 미적용 (무음 구간 환각 가능 → 보수적 임계값으로만 완화)
+- 구간 경계(10분)에 걸친 문장은 드물게 잘릴 수 있음 (4초 겹침으로 완화)
 
 ## 라이선스
 

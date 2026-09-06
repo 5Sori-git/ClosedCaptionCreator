@@ -12,6 +12,12 @@ export default defineConfig({
     // onnxruntime-web / ffmpeg 는 자체 wasm 로더를 쓰므로 Vite 사전번들에서 제외
     exclude: ["@huggingface/transformers", "@ffmpeg/ffmpeg", "@ffmpeg/util"],
   },
+  build: {
+    // onnxruntime-web 의 21MB wasm 에 대해 gzip 크기를 계산하지 않는다
+    // (대용량 에셋에서 빌드가 메모리 스파이크로 죽는 것을 방지)
+    reportCompressedSize: false,
+    chunkSizeWarningLimit: 2048,
+  },
   server: {
     port: process.env.PORT ? Number(process.env.PORT) : 5173,
     // 로컬 개발에서도 cross-origin isolation 을 켜서 배포 환경과 동일하게 테스트

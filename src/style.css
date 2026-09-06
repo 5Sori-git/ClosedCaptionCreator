@@ -124,6 +124,27 @@ header p {
   word-break: break-all;
 }
 
+.resume-note {
+  margin-top: 10px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 0.83rem;
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warn) 35%, var(--border));
+}
+
+.run-row {
+  display: flex;
+  gap: 10px;
+}
+
+.result-meta {
+  font-size: 0.8rem;
+  font-weight: 400;
+  color: var(--text-dim);
+}
+
 .options {
   display: grid;
   grid-template-columns: 1fr 1fr;
