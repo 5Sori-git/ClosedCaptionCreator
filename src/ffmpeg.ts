@@ -1,24 +1,33 @@
 /**
- * 영상 컨테이너(mp4/mov/mkv/webm 등)에서 오디오 트랙만 뽑아
- * 16kHz mono WAV(ArrayBuffer)로 돌려준다. ffmpeg.wasm 사용.
+ * ffmpeg.wasm 래퍼.
  *
- * cross-origin isolation(crossOriginIsolated === true) 이면 멀티스레드 코어를,
- * 아니면 싱글스레드 코어를 unpkg 에서 로드한다. 두 경우 모두 toBlobURL 로
- * 받아오므로 COEP require-corp 하에서도 차단되지 않는다.
+ * 핵심: 입력 파일을 WASM 힙에 통째로 복사하지 않는다.
+ * `mount(WORKERFS, { files: [file] })` 로 Blob 을 지연 마운트하고,
+ * `-ss / -t` 로 필요한 시간 구간만 16kHz mono float32 raw PCM 으로 뽑는다.
+ * → 파일 크기는 디스크 용량까지, 메모리는 "한 구간분"으로 제한된다.
  */
-import { FFmpeg } from "@ffmpeg/ffmpeg";
+import { FFmpeg, FFFSType } from "@ffmpeg/ffmpeg";
 import { toBlobURL } from "@ffmpeg/util";
-import { readFileBytes } from "./readfile";
 
 const CORE_VERSION = "0.12.6";
+const MOUNT_DIR = "/mnt";
 
-let ffmpegPromise: Promise<FFmpeg> | null = null;
+export const SAMPLE_RATE = 16000;
 
 type Logger = (message: string) => void;
 
-async function createFFmpeg(onLog?: Logger): Promise<FFmpeg> {
-  const ffmpeg = new FFmpeg();
-  if (onLog) ffmpeg.on("log", ({ message }) => onLog(message));
+let ffmpeg: FFmpeg | null = null;
+let loadPromise: Promise<FFmpeg> | null = null;
+let mountedPath: string | null = null;
+const logBuffer: string[] = [];
+
+async function doLoad(onLog?: Logger): Promise<FFmpeg> {
+  const ff = new FFmpeg();
+  ff.on("log", ({ message }) => {
+    logBuffer.push(message);
+    if (logBuffer.length > 800) logBuffer.shift();
+    onLog?.(message);
+  });
 
   const multiThread = typeof crossOriginIsolated !== "undefined" && crossOriginIsolated;
   const pkg = multiThread ? "core-mt" : "core";
@@ -26,7 +35,7 @@ async function createFFmpeg(onLog?: Logger): Promise<FFmpeg> {
 
   onLog?.(`ffmpeg 코어 로드 중 (${multiThread ? "멀티스레드" : "싱글스레드"})...`);
 
-  await ffmpeg.load({
+  await ff.load({
     coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
     wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
     ...(multiThread
@@ -34,54 +43,109 @@ async function createFFmpeg(onLog?: Logger): Promise<FFmpeg> {
       : {}),
   });
 
-  return ffmpeg;
+  ffmpeg = ff;
+  return ff;
 }
 
-function getFFmpeg(onLog?: Logger): Promise<FFmpeg> {
-  if (!ffmpegPromise) {
-    ffmpegPromise = createFFmpeg(onLog).catch((err) => {
-      ffmpegPromise = null;
-      throw err;
+export function loadFFmpeg(onLog?: Logger): Promise<FFmpeg> {
+  if (!loadPromise) {
+    loadPromise = doLoad(onLog).catch((err) => {
+      loadPromise = null;
+      throw new Error(
+        `ffmpeg 코어 로드 실패: ${err instanceof Error ? err.message : String(err)} ` +
+          `(네트워크 연결 또는 unpkg.com 차단 여부를 확인하세요)`,
+      );
     });
   }
-  return ffmpegPromise;
+  return loadPromise;
 }
 
-export async function extractAudioFromVideo(
-  file: File,
+/**
+ * 파일을 WORKERFS 로 마운트하고 ffmpeg 내부 경로를 돌려준다.
+ * 이 시점에 파일 내용은 메모리로 복사되지 않는다.
+ */
+export async function mountFile(file: File, onLog?: Logger): Promise<string> {
+  const ff = await loadFFmpeg(onLog);
+
+  if (mountedPath) {
+    await ff.unmount(MOUNT_DIR).catch(() => {});
+    mountedPath = null;
+  }
+
+  await ff.createDir(MOUNT_DIR).catch(() => {});
+  await ff.mount(FFFSType.WORKERFS, { files: [file] }, MOUNT_DIR);
+
+  mountedPath = `${MOUNT_DIR}/${file.name}`;
+  onLog?.(`파일 마운트: ${mountedPath} (지연 로딩)`);
+  return mountedPath;
+}
+
+export async function unmountFile(): Promise<void> {
+  if (!ffmpeg || !mountedPath) return;
+  await ffmpeg.unmount(MOUNT_DIR).catch(() => {});
+  mountedPath = null;
+}
+
+/** 미디어 전체 길이(초). 알 수 없으면 0. */
+export async function probeDurationSec(inputPath: string, onLog?: Logger): Promise<number> {
+  const ff = await loadFFmpeg(onLog);
+  logBuffer.length = 0;
+  try {
+    // 출력 파일을 주지 않으면 ffmpeg 는 비정상 종료하지만 Duration 은 로그에 남는다
+    await ff.exec(["-hide_banner", "-i", inputPath]);
+  } catch {
+    /* expected */
+  }
+  const m = logBuffer.join("\n").match(/Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)/);
+  if (!m) return 0;
+  return Number(m[1]) * 3600 + Number(m[2]) * 60 + parseFloat(m[3]);
+}
+
+/**
+ * [startSec, startSec+durSec] 구간의 오디오를 16kHz mono Float32Array 로.
+ * 데이터가 없으면(파일 끝을 지난 경우) 길이 0 배열.
+ */
+export async function extractSegmentPcm(
+  inputPath: string,
+  startSec: number,
+  durSec: number,
   onLog?: Logger,
-): Promise<ArrayBuffer> {
-  const ffmpeg = await getFFmpeg(onLog);
+): Promise<Float32Array> {
+  const ff = await loadFFmpeg(onLog);
+  const out = "seg.f32";
 
-  const ext = file.name.match(/\.[a-z0-9]+$/i)?.[0]?.toLowerCase() || ".mp4";
-  const inputName = `input${ext}`;
-  const outputName = "audio.wav";
-
-  onLog?.("입력 파일 읽는 중...");
-  const bytes = await readFileBytes(file);
-
-  onLog?.(`입력 파일 기록 중... (${(bytes.byteLength / 1024 / 1024).toFixed(1)}MB)`);
-  await ffmpeg.writeFile(inputName, bytes);
-
-  onLog?.("오디오 트랙 추출 중...");
-  await ffmpeg.exec([
+  await ff.exec([
+    "-hide_banner",
+    "-ss",
+    startSec.toFixed(3),
     "-i",
-    inputName,
+    inputPath,
+    "-t",
+    durSec.toFixed(3),
     "-vn",
     "-ac",
     "1",
     "-ar",
-    "16000",
-    "-c:a",
-    "pcm_s16le",
-    outputName,
+    String(SAMPLE_RATE),
+    "-f",
+    "f32le",
+    "-acodec",
+    "pcm_f32le",
+    "-y",
+    out,
   ]);
 
-  const data = (await ffmpeg.readFile(outputName)) as Uint8Array;
+  let bytes: Uint8Array;
+  try {
+    bytes = (await ff.readFile(out)) as Uint8Array;
+  } catch {
+    return new Float32Array(0);
+  }
+  await ff.deleteFile(out).catch(() => {});
 
-  await ffmpeg.deleteFile(inputName).catch(() => {});
-  await ffmpeg.deleteFile(outputName).catch(() => {});
+  if (bytes.byteLength < 4) return new Float32Array(0);
 
-  // 복사본을 만들어 ArrayBuffer 로 반환 (원본 뷰는 재사용될 수 있음)
-  return data.slice().buffer;
+  // Float32Array 는 4바이트 정렬이 필요 → 복사본(offset 0)으로 변환
+  const usable = bytes.byteLength - (bytes.byteLength % 4);
+  return new Float32Array(bytes.slice(0, usable).buffer);
 }

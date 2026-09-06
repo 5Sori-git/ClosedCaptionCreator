@@ -1,28 +1,28 @@
 import "./style.css";
-import { fileToPcm16k } from "./audio";
 import { MODELS, type DeviceKind, type ModelKey } from "./models";
+import { toSRT, toVTT, toPlainText, type Cue } from "./subtitle";
 import {
-  chunksToCues,
-  toSRT,
-  toVTT,
-  toPlainText,
-  type WhisperChunk,
-} from "./subtitle";
+  runPipeline,
+  fmtDuration,
+  WINDOW_SEC,
+  type PipelineOptions,
+} from "./pipeline";
+import { makeSignature, peekProgress } from "./progress-store";
 
 /* ------------------------------------------------------------------ *
  * 상태
  * ------------------------------------------------------------------ */
-type Phase = "idle" | "working" | "done" | "error";
-
 const state: {
   file: File | null;
-  phase: Phase;
+  running: boolean;
+  cancelRequested: boolean;
   device: DeviceKind;
   webgpu: boolean;
-  cues: ReturnType<typeof chunksToCues>;
+  cues: Cue[];
 } = {
   file: null,
-  phase: "idle",
+  running: false,
+  cancelRequested: false,
   device: "wasm",
   webgpu: false,
   cues: [],
@@ -49,6 +49,7 @@ app.innerHTML = `
     </div>
     <input type="file" id="fileInput" accept="audio/*,video/*" class="hidden" />
     <div class="file-line hidden" id="fileLine"></div>
+    <div class="resume-note hidden" id="resumeNote"></div>
   </section>
 
   <section class="panel">
@@ -73,7 +74,9 @@ app.innerHTML = `
   </section>
 
   <section class="panel">
-    <button class="primary" id="runBtn" disabled>자막 생성</button>
+    <div class="run-row">
+      <button class="primary" id="runBtn" disabled>자막 생성</button>
+    </div>
     <div class="progress-wrap hidden" id="progressWrap">
       <div class="bar"><div id="bar"></div></div>
       <p class="status-text" id="statusText"></p>
@@ -85,7 +88,7 @@ app.innerHTML = `
   </section>
 
   <section class="panel hidden" id="resultPanel">
-    <h2>3. 결과</h2>
+    <h2>3. 결과 <span id="resultMeta" class="result-meta"></span></h2>
     <div id="mediaMount"></div>
     <div class="result-actions">
       <button data-dl="srt">SRT 다운로드</button>
@@ -97,7 +100,7 @@ app.innerHTML = `
   </section>
 
   <footer>
-    모든 연산은 이 브라우저에서 수행됩니다 · Whisper (Transformers.js) ·
+    모든 연산은 이 브라우저에서 수행됩니다 · Whisper (Transformers.js) · ${WINDOW_SEC / 60}분 구간 스트리밍 ·
     <a href="https://github.com/5Sori-git/ClosedCaptionCreator" target="_blank" rel="noopener">GitHub</a>
   </footer>
 `;
@@ -107,6 +110,7 @@ const el = {
   dropzone: document.querySelector<HTMLDivElement>("#dropzone")!,
   fileInput: document.querySelector<HTMLInputElement>("#fileInput")!,
   fileLine: document.querySelector<HTMLDivElement>("#fileLine")!,
+  resumeNote: document.querySelector<HTMLDivElement>("#resumeNote")!,
   modelSelect: document.querySelector<HTMLSelectElement>("#modelSelect")!,
   langSelect: document.querySelector<HTMLSelectElement>("#langSelect")!,
   modelNote: document.querySelector<HTMLDivElement>("#modelNote")!,
@@ -117,6 +121,7 @@ const el = {
   logDetails: document.querySelector<HTMLDetailsElement>("#logDetails")!,
   logBody: document.querySelector<HTMLPreElement>("#logBody")!,
   resultPanel: document.querySelector<HTMLElement>("#resultPanel")!,
+  resultMeta: document.querySelector<HTMLSpanElement>("#resultMeta")!,
   mediaMount: document.querySelector<HTMLDivElement>("#mediaMount")!,
   subsArea: document.querySelector<HTMLTextAreaElement>("#subsArea")!,
 };
@@ -143,6 +148,7 @@ function setBar(pct: number) {
 function humanSize(bytes: number): string {
   if (!bytes) return "";
   const mb = bytes / 1024 / 1024;
+  if (mb >= 1024) return `${(mb / 1024).toFixed(2)}GB`;
   return mb >= 1 ? `${mb.toFixed(1)}MB` : `${(bytes / 1024).toFixed(0)}KB`;
 }
 
@@ -160,6 +166,14 @@ function baseName(name: string): string {
   return name.replace(/\.[^.]+$/, "") || "subtitle";
 }
 
+function relTime(ts: number): string {
+  const diffMin = Math.round((Date.now() - ts) / 60000);
+  if (diffMin < 1) return "방금 전";
+  if (diffMin < 60) return `${diffMin}분 전`;
+  const h = Math.round(diffMin / 60);
+  return h < 24 ? `${h}시간 전` : `${Math.round(h / 24)}일 전`;
+}
+
 /* ------------------------------------------------------------------ *
  * 환경 배지
  * ------------------------------------------------------------------ */
@@ -167,8 +181,7 @@ async function detectWebGPU(): Promise<boolean> {
   const gpu = (navigator as unknown as { gpu?: { requestAdapter(): Promise<unknown> } }).gpu;
   if (!gpu) return false;
   try {
-    const adapter = await gpu.requestAdapter();
-    return Boolean(adapter);
+    return Boolean(await gpu.requestAdapter());
   } catch {
     return false;
   }
@@ -177,18 +190,16 @@ async function detectWebGPU(): Promise<boolean> {
 async function renderBadges() {
   state.webgpu = await detectWebGPU();
   state.device = state.webgpu ? "webgpu" : "wasm";
-
   const isolated = typeof crossOriginIsolated !== "undefined" && crossOriginIsolated;
 
-  const badges: Array<{ text: string; cls: string }> = [
+  const badges = [
     state.webgpu
       ? { text: "WebGPU 사용 가능 — 빠름", cls: "good" }
       : { text: "WebGPU 없음 — WASM 모드(느림)", cls: "warn" },
     isolated
       ? { text: "cross-origin isolated ✓", cls: "good" }
-      : { text: "isolation 미적용 — 영상 추출/멀티스레드 제한", cls: "warn" },
+      : { text: "isolation 미적용 — ffmpeg 싱글스레드", cls: "warn" },
   ];
-
   el.badges.innerHTML = badges
     .map((b) => `<span class="badge ${b.cls}">${b.text}</span>`)
     .join("");
@@ -202,19 +213,32 @@ function renderModelOptions() {
   el.modelSelect.innerHTML = keys
     .map((k) => `<option value="${k}">${MODELS[k].label} · ${MODELS[k].approxSize}</option>`)
     .join("");
-  // 기본값: WebGPU 있으면 turbo, 없으면 small
   el.modelSelect.value = state.webgpu ? "turbo" : "small";
   updateModelNote();
 }
 
 function updateModelNote() {
   const key = el.modelSelect.value as ModelKey;
-  const info = MODELS[key];
-  let note = info.note;
+  let note = MODELS[key].note;
   if (key === "turbo" && !state.webgpu) {
     note += " ⚠ 현재 WebGPU가 없어 매우 느립니다. small 을 권장합니다.";
   }
   el.modelNote.textContent = note;
+}
+
+/* ------------------------------------------------------------------ *
+ * 재개 안내
+ * ------------------------------------------------------------------ */
+function refreshResumeNote() {
+  const saved = peekProgress();
+  if (!saved) {
+    el.resumeNote.classList.add("hidden");
+    return;
+  }
+  el.resumeNote.classList.remove("hidden");
+  el.resumeNote.textContent =
+    `저장된 진행 상태가 있습니다 (${saved.pct.toFixed(0)}% 완료, ${relTime(saved.updatedAt)}). ` +
+    `같은 파일·같은 옵션으로 "자막 생성"을 누르면 이어서 진행할지 물어봅니다.`;
 }
 
 /* ------------------------------------------------------------------ *
@@ -224,7 +248,7 @@ function acceptFile(file: File) {
   state.file = file;
   el.fileLine.classList.remove("hidden");
   el.fileLine.textContent = `${file.name} · ${humanSize(file.size)} · ${file.type || "형식 미상"}`;
-  el.runBtn.disabled = state.phase === "working";
+  el.runBtn.disabled = state.running;
 }
 
 el.dropzone.addEventListener("click", () => el.fileInput.click());
@@ -252,169 +276,146 @@ el.dropzone.addEventListener("drop", (e) => {
 el.modelSelect.addEventListener("change", updateModelNote);
 
 /* ------------------------------------------------------------------ *
- * 워커
+ * 미디어 미리보기
  * ------------------------------------------------------------------ */
-const worker = new Worker(new URL("./transcriber.worker.ts", import.meta.url), {
-  type: "module",
-});
+let mediaUrl: string | null = null;
+let trackUrl: string | null = null;
+let trackEl: HTMLTrackElement | null = null;
 
-let resolveReady: (() => void) | null = null;
-let resolveResult: ((r: { chunks: WhisperChunk[]; text: string; elapsedSec: number }) => void) | null =
-  null;
-let rejectActive: ((err: Error) => void) | null = null;
+function mountMedia(file: File) {
+  if (mediaUrl) URL.revokeObjectURL(mediaUrl);
+  el.mediaMount.innerHTML = "";
 
-worker.addEventListener("message", (event) => {
-  const msg = event.data;
-  switch (msg.type) {
-    case "log":
-      log(msg.message);
-      break;
-    case "download": {
-      setBar(msg.overall);
-      const done = msg.files.filter((f: { progress: number }) => f.progress >= 100).length;
-      setStatus(
-        `모델 다운로드 중 ${msg.overall.toFixed(0)}% · 파일 ${done}/${msg.files.length} (최초 1회, 이후 캐시)`,
-      );
-      break;
-    }
-    case "ready":
-      log(`워커 준비 완료 (device=${msg.device})`);
-      resolveReady?.();
-      resolveReady = null;
-      break;
-    case "result":
-      resolveResult?.({ chunks: msg.chunks as WhisperChunk[], text: msg.text, elapsedSec: msg.elapsedSec });
-      resolveResult = null;
-      break;
-    case "error":
-      log(`오류: ${msg.message}`);
-      rejectActive?.(new Error(msg.message));
-      rejectActive = null;
-      break;
-  }
-});
+  const isVideo =
+    file.type.startsWith("video/") || /\.(mp4|m4v|mov|mkv|webm)$/i.test(file.name);
+  mediaUrl = URL.createObjectURL(file);
 
-function loadModel(modelKey: ModelKey, device: DeviceKind): Promise<void> {
-  return new Promise((resolve, reject) => {
-    resolveReady = resolve;
-    rejectActive = reject;
-    worker.postMessage({ type: "load", modelKey, device });
-  });
+  const media = document.createElement(isVideo ? "video" : "audio") as HTMLMediaElement;
+  media.controls = true;
+  media.src = mediaUrl;
+  trackEl = document.createElement("track");
+  trackEl.kind = "subtitles";
+  trackEl.label = "생성된 자막";
+  trackEl.srclang = "ko";
+  trackEl.default = true;
+  media.appendChild(trackEl);
+  el.mediaMount.appendChild(media);
 }
 
-function runTranscribe(
-  audio: Float32Array,
-  language: string,
-): Promise<{ chunks: WhisperChunk[]; text: string; elapsedSec: number }> {
-  return new Promise((resolve, reject) => {
-    resolveResult = resolve;
-    rejectActive = reject;
-    // audio 버퍼 소유권 이전 (복사 비용 제거)
-    worker.postMessage({ type: "transcribe", audio, language }, [audio.buffer]);
-  });
+function updateTrack(cues: Cue[]) {
+  if (!trackEl) return;
+  if (trackUrl) URL.revokeObjectURL(trackUrl);
+  trackUrl = URL.createObjectURL(new Blob([toVTT(cues)], { type: "text/vtt" }));
+  trackEl.src = trackUrl;
 }
 
 /* ------------------------------------------------------------------ *
- * 실행
+ * 실행 / 중지
  * ------------------------------------------------------------------ */
-el.runBtn.addEventListener("click", run);
+el.runBtn.addEventListener("click", () => {
+  if (state.running) {
+    state.cancelRequested = true;
+    el.runBtn.disabled = true;
+    setStatus("중지 요청됨 — 현재 구간을 마치고 멈춥니다…");
+    return;
+  }
+  run();
+});
 
 async function run() {
-  if (!state.file || state.phase === "working") return;
+  if (!state.file) return;
 
-  state.phase = "working";
-  el.runBtn.disabled = true;
+  const file = state.file;
+  const modelKey = el.modelSelect.value as ModelKey;
+  const langValue = el.langSelect.value;
+  const language = langValue === "auto" ? "" : langValue;
+
+  // 재개 여부 결정
+  let resume = false;
+  const sig = makeSignature(file, modelKey, language, WINDOW_SEC);
+  const saved = peekProgress();
+  if (saved && saved.sig === sig) {
+    resume = window.confirm(
+      `저장된 진행 상태(${saved.pct.toFixed(0)}% 완료)가 있습니다.\n` +
+        `확인 = 이어서 진행 / 취소 = 처음부터 다시`,
+    );
+  }
+
+  state.running = true;
+  state.cancelRequested = false;
+  el.runBtn.textContent = "중지";
+  el.runBtn.disabled = false;
   el.progressWrap.classList.remove("hidden");
   el.resultPanel.classList.add("hidden");
   el.logBody.textContent = "";
   setBar(0);
+  setStatus("시작하는 중…");
 
-  const modelKey = el.modelSelect.value as ModelKey;
-  const language = el.langSelect.value;
-  const file = state.file;
+  mountMedia(file);
+
+  const options: PipelineOptions = { file, modelKey, device: state.device, language, resume };
 
   try {
-    setStatus("오디오 준비 중…");
-    const { pcm, durationSec } = await fileToPcm16k(file, log);
-    log(`오디오 길이 ${durationSec.toFixed(1)}초, 샘플 ${pcm.length.toLocaleString()}개`);
+    const result = await runPipeline(options, {
+      onLog: log,
+      onModelDownload: (pct, detail) => {
+        setBar(pct);
+        setStatus(detail);
+      },
+      onPhase: (label) => setStatus(label),
+      onWindow: ({ processedSec, totalSec, cues }) => {
+        state.cues = cues;
+        el.subsArea.value = toSRT(cues);
+        el.resultPanel.classList.remove("hidden");
+        updateTrack(cues);
+        if (totalSec > 0) {
+          const pct = (processedSec / totalSec) * 100;
+          setBar(pct);
+          setStatus(
+            `전사 중 ${pct.toFixed(0)}% · ${fmtDuration(processedSec)} / ${fmtDuration(totalSec)} · 자막 ${cues.length}줄`,
+          );
+        } else {
+          setStatus(`전사 중 · ${fmtDuration(processedSec)} 처리 · 자막 ${cues.length}줄`);
+        }
+        el.resultMeta.textContent = `(진행 중 · ${cues.length}줄)`;
+      },
+      shouldCancel: () => state.cancelRequested,
+    });
 
-    setStatus("모델 로드 중…");
-    await loadModel(modelKey, state.device);
+    state.cues = result.cues;
+    el.subsArea.value = toSRT(result.cues);
+    updateTrack(result.cues);
+    el.resultPanel.classList.remove("hidden");
+    el.resultMeta.textContent = `· 자막 ${result.cues.length}줄 · ${fmtDuration(result.totalSec)}`;
 
-    setBar(100);
-    setStatus(
-      state.device === "webgpu"
-        ? "전사 중… (GPU) 길이에 따라 수십 초~수 분 소요"
-        : "전사 중… (CPU/WASM) 상당히 오래 걸릴 수 있습니다",
-    );
-
-    const { chunks, text, elapsedSec } = await runTranscribe(
-      pcm,
-      language === "auto" ? "" : language,
-    );
-    log(`전사 완료: ${elapsedSec.toFixed(1)}초, 세그먼트 ${chunks.length}개`);
-
-    const cues = chunksToCues(chunks, { totalDuration: durationSec });
-    state.cues = cues;
-
-    if (cues.length === 0) {
+    if (result.canceled) {
+      setStatus(
+        `중지됨 · 자막 ${result.cues.length}줄까지 저장. 같은 파일·옵션으로 다시 실행하면 이어서 진행합니다.`,
+      );
+    } else if (result.cues.length === 0) {
       setStatus("인식된 음성이 없습니다. 다른 파일이나 모델을 시도해 보세요.", true);
-      state.phase = "error";
-      el.runBtn.disabled = false;
-      return;
+    } else {
+      setBar(100);
+      setStatus(
+        `완료 · 자막 ${result.cues.length}줄 · 소요 ${fmtDuration(result.elapsedSec)}`,
+      );
     }
-
-    renderResult(file, cues, text);
-    setStatus(`완료 · 자막 ${cues.length}줄 · 전사 ${elapsedSec.toFixed(1)}초`);
-    state.phase = "done";
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     setStatus(`실패: ${message}`, true);
     log(`실패: ${message}`);
-    state.phase = "error";
   } finally {
+    state.running = false;
+    state.cancelRequested = false;
+    el.runBtn.textContent = "자막 생성";
     el.runBtn.disabled = false;
+    refreshResumeNote();
   }
 }
 
 /* ------------------------------------------------------------------ *
- * 결과 렌더
+ * 결과 다운로드
  * ------------------------------------------------------------------ */
-let mediaUrl: string | null = null;
-let trackUrl: string | null = null;
-
-function renderResult(
-  file: File,
-  cues: ReturnType<typeof chunksToCues>,
-  _rawText: string,
-) {
-  el.resultPanel.classList.remove("hidden");
-  el.subsArea.value = toSRT(cues);
-
-  // 미디어 미리보기 + 자막 트랙
-  if (mediaUrl) URL.revokeObjectURL(mediaUrl);
-  if (trackUrl) URL.revokeObjectURL(trackUrl);
-  el.mediaMount.innerHTML = "";
-
-  const isVideo = file.type.startsWith("video/") || /\.(mp4|m4v|mov|mkv|webm)$/i.test(file.name);
-  mediaUrl = URL.createObjectURL(file);
-  trackUrl = URL.createObjectURL(new Blob([toVTT(cues)], { type: "text/vtt" }));
-
-  const media = document.createElement(isVideo ? "video" : "audio") as
-    | HTMLVideoElement
-    | HTMLAudioElement;
-  media.controls = true;
-  media.src = mediaUrl;
-  const track = document.createElement("track");
-  track.kind = "subtitles";
-  track.label = "생성된 자막";
-  track.srclang = "ko";
-  track.default = true;
-  track.src = trackUrl;
-  media.appendChild(track);
-  el.mediaMount.appendChild(media);
-}
-
 el.resultPanel.addEventListener("click", (e) => {
   const target = e.target as HTMLElement;
   const dl = target.dataset.dl;
@@ -437,5 +438,6 @@ el.resultPanel.addEventListener("click", (e) => {
 (async function init() {
   await renderBadges();
   renderModelOptions();
+  refreshResumeNote();
   log("준비 완료. 파일을 선택하세요.");
 })();
